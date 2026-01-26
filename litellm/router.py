@@ -223,6 +223,7 @@ class Router:
         redis_host: Optional[str] = None,
         redis_port: Optional[int] = None,
         redis_password: Optional[str] = None,
+        redis_db: Optional[int] = None,
         cache_responses: Optional[bool] = False,
         cache_kwargs: dict = {},  # additional kwargs to pass to RedisCache (see caching.py)
         caching_groups: Optional[
@@ -300,6 +301,7 @@ class Router:
             redis_host (Optional[str]): Hostname of the Redis server. Defaults to None.
             redis_port (Optional[int]): Port of the Redis server. Defaults to None.
             redis_password (Optional[str]): Password of the Redis server. Defaults to None.
+            redis_db (Optional[int]): DB of the Redis server. Defaults to None.
             cache_responses (Optional[bool]): Flag to enable caching of responses. Defaults to False.
             cache_kwargs (dict): Additional kwargs to pass to RedisCache. Defaults to {}.
             caching_groups (Optional[List[tuple]]): List of model groups for caching across model groups. Defaults to None.
@@ -408,6 +410,12 @@ class Router:
 
             if redis_password is not None:
                 cache_config["password"] = redis_password
+
+            if redis_db is not None:
+                verbose_router_logger.warning(
+                    "Deprecated 'redis_db' argument used. Please remove 'redis_db' from your config/database and use 'cache_kwargs' instead."
+                )
+                cache_config["db"] = str(redis_db)
 
             # Add additional key-value pairs from cache_kwargs
             cache_config.update(cache_kwargs)
@@ -4692,9 +4700,12 @@ class Router:
                 # get num_retries from retry policy
                 # Use the model_group captured at the start of the function, or get it from metadata
                 # kwargs.get("model") at this point is the deployment model, not the model_group
-                _model_group_for_retry_policy = model_group or _metadata.get("model_group") or kwargs.get("model")
+                _model_group_for_retry_policy = (
+                    model_group or _metadata.get("model_group") or kwargs.get("model")
+                )
                 _retry_policy_retries = self.get_num_retries_from_retry_policy(
-                    exception=original_exception, model_group=_model_group_for_retry_policy
+                    exception=original_exception,
+                    model_group=_model_group_for_retry_policy,
                 )
                 if _retry_policy_retries is not None:
                     num_retries = _retry_policy_retries
@@ -5879,7 +5890,10 @@ class Router:
             )
             # done reading model["litellm_params"]
             # Check if provider is supported: either in enum or JSON-configured
-            if custom_llm_provider not in litellm.provider_list and not JSONProviderRegistry.exists(custom_llm_provider):
+            if (
+                custom_llm_provider not in litellm.provider_list
+                and not JSONProviderRegistry.exists(custom_llm_provider)
+            ):
                 raise Exception(f"Unsupported provider - {custom_llm_provider}")
 
         #### DEPLOYMENT NAMES INIT ########
