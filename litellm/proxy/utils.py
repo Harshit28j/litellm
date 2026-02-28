@@ -896,7 +896,7 @@ class ProxyLogging:
         original_messages = None
         target_indices = None
         if (
-            hook_type == "pre_call"
+            hook_type in ("pre_call", "during_call")
             and hasattr(callback, "experimental_use_latest_role_message_only")
             and callback.experimental_use_latest_role_message_only
             and isinstance(data.get("messages"), list)
@@ -1443,6 +1443,9 @@ class ProxyLogging:
         """
         # Step 1: Collect all guardrail tasks to run in parallel
         guardrail_tasks = []
+        filtered_guardrail_infos: list = (
+            []
+        )  # Track (callback, data_copy, original_messages, target_indices) for merging back
 
         for callback in litellm.callbacks:
             if isinstance(callback, CustomGuardrail):
@@ -1486,11 +1489,21 @@ class ProxyLogging:
                     import copy
 
                     data_for_guardrail = copy.copy(data)
-                    filtered, _, _ = callback.filter_messages_for_latest_role(
-                        data["messages"]
-                    )
+                    (
+                        filtered,
+                        original_messages,
+                        target_indices,
+                    ) = callback.filter_messages_for_latest_role(data["messages"])
                     if filtered is not None:
                         data_for_guardrail["messages"] = filtered
+                        filtered_guardrail_infos.append(
+                            (
+                                callback,
+                                data_for_guardrail,
+                                original_messages,
+                                target_indices,
+                            )
+                        )
 
                 if (
                     "apply_guardrail" in type(callback).__dict__
@@ -1514,9 +1527,14 @@ class ProxyLogging:
         if guardrail_tasks:
             try:
                 await asyncio.gather(*guardrail_tasks)
-            except Exception as e:
-                # If any guardrail raises an exception, it will propagate here
-                raise e
+            finally:
+                # Merge back any filtered message modifications so guardrail
+                # changes (e.g. PII masking) propagate to the original data.
+                for cb, data_copy, orig_msgs, indices in filtered_guardrail_infos:
+                    if orig_msgs is not None and indices is not None:
+                        data["messages"] = cb.merge_filtered_messages(
+                            orig_msgs, data_copy["messages"], indices
+                        )
 
         return data
 

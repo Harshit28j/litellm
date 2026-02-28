@@ -1,3 +1,4 @@
+import copy
 from datetime import datetime
 from typing import (
     TYPE_CHECKING,
@@ -133,8 +134,6 @@ class CustomGuardrail(CustomLogger):
         Optional[List[int]],
     ]:
         """Filter to only the latest message for target_role."""
-        import copy
-
         for index in range(len(messages) - 1, -1, -1):
             if messages[index].get("role") == target_role:
                 return [copy.deepcopy(messages[index])], list(messages), [index]
