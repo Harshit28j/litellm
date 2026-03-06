@@ -735,13 +735,16 @@ class OpenTelemetry(CustomLogger):
             self._maybe_log_raw_request(
                 kwargs, response_obj, start_time, end_time, span
             )
-            # Ensure proxy-request parent span is annotated with the actual operation kind
+            # Set only minimal identification attributes on the proxy-request parent
+            # to avoid duplicating all attributes that already exist on litellm_request
             if (
                 parent_span is not None
                 and hasattr(parent_span, "name")
                 and parent_span.name == LITELLM_PROXY_REQUEST_SPAN_NAME
             ):
-                self.set_attributes(parent_span, kwargs, response_obj)
+                self._set_proxy_span_minimal_attributes(
+                    parent_span, kwargs, response_obj
+                )
         else:
             # Do not create primary span (keep hierarchy shallow when parent exists)
             from opentelemetry.trace import Status, StatusCode
@@ -778,6 +781,42 @@ class OpenTelemetry(CustomLogger):
             and parent_span.name == LITELLM_PROXY_REQUEST_SPAN_NAME
         ):
             parent_span.end(end_time=self._to_ns(end_time))
+
+    def _set_proxy_span_minimal_attributes(
+        self, span: "Span", kwargs, response_obj
+    ):
+        """
+        Set only minimal identification attributes on the proxy-request parent span.
+
+        This avoids duplicating the full attribute set that already exists on the
+        child litellm_request span, reducing storage and search noise.
+        """
+        from litellm.proxy._types import SpanAttributes
+
+        standard_logging_payload: Optional[StandardLoggingPayload] = kwargs.get(
+            "standard_logging_object"
+        )
+
+        if kwargs.get("model"):
+            self.safe_set_attribute(
+                span=span,
+                key=SpanAttributes.LLM_REQUEST_MODEL.value,
+                value=kwargs.get("model"),
+            )
+
+        if standard_logging_payload:
+            self.safe_set_attribute(
+                span=span,
+                key=SpanAttributes.LLM_REQUEST_TYPE.value,
+                value=standard_logging_payload.get("call_type"),
+            )
+
+        if response_obj and response_obj.get("id"):
+            self.safe_set_attribute(
+                span=span,
+                key="gen_ai.response.id",
+                value=response_obj.get("id"),
+            )
 
     def _start_primary_span(
         self,
@@ -1149,8 +1188,17 @@ class OpenTelemetry(CustomLogger):
         self, kwargs: Optional[dict], context: Optional[Context]
     ):
         """
-        Creates a span for Guardrail, if any guardrail information is present in standard_logging_object
+        Creates a span for Guardrail, if any guardrail information is present in standard_logging_object.
+
+        Only creates spans when a valid parent context exists to prevent orphaned
+        root-level guardrail traces in the "All Spans" view.
         """
+        if context is None:
+            verbose_logger.debug(
+                "OpenTelemetry: Skipping guardrail span creation - no parent context (would create orphaned trace)"
+            )
+            return
+
         # Create span for guardrail information
         kwargs = kwargs or {}
         standard_logging_payload: Optional[StandardLoggingPayload] = kwargs.get(
@@ -1579,12 +1627,18 @@ class OpenTelemetry(CustomLogger):
                     value=optional_params.get("user"),
                 )
 
-            # The unique identifier for the completion.
-            if response_obj and response_obj.get("id"):
+            # The unique identifier for the LLM call.
+            # Falls back to litellm_call_id for response types without an id field
+            # (e.g. EmbeddingResponse, ImageResponse).
+            _response_id = (
+                (response_obj.get("id") if response_obj else None)
+                or kwargs.get("litellm_call_id")
+            )
+            if _response_id:
                 self.safe_set_attribute(
                     span=span,
                     key="gen_ai.response.id",
-                    value=response_obj.get("id"),
+                    value=_response_id,
                 )
 
             # The model used to generate the response.
@@ -1808,8 +1862,6 @@ class OpenTelemetry(CustomLogger):
 
     def set_raw_request_attributes(self, span: Span, kwargs, response_obj):
         try:
-            self.set_attributes(span, kwargs, response_obj)
-            kwargs.get("optional_params", {})
             litellm_params = kwargs.get("litellm_params", {}) or {}
             custom_llm_provider = litellm_params.get("custom_llm_provider", "Unknown")
 

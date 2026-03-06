@@ -45,8 +45,17 @@ class TestOpenTelemetryGuardrails(unittest.TestCase):
             "standard_logging_object": {"guardrail_information": [guardrail_info]}
         }
 
+        # Create a valid parent context to avoid orphaned span prevention
+        parent_context = trace.set_span_in_context(trace.NonRecordingSpan(
+            trace.SpanContext(
+                trace_id=1,
+                span_id=1,
+                is_remote=False,
+            )
+        ))
+
         # Call the method
-        otel._create_guardrail_span(kwargs=kwargs, context=None)
+        otel._create_guardrail_span(kwargs=kwargs, context=parent_context)
 
         # Assertions
         otel.tracer.start_span.assert_called_once()
@@ -76,9 +85,27 @@ class TestOpenTelemetryGuardrails(unittest.TestCase):
 
         # Test with no guardrail information
         kwargs = {"standard_logging_object": {}}
-        otel._create_guardrail_span(kwargs=kwargs, context=None)
+        parent_context = trace.set_span_in_context(trace.NonRecordingSpan(
+            trace.SpanContext(trace_id=1, span_id=1, is_remote=False)
+        ))
+        otel._create_guardrail_span(kwargs=kwargs, context=parent_context)
 
         # Verify that start_span was never called
+        otel.tracer.start_span.assert_not_called()
+
+    def test_create_guardrail_span_with_no_context(self):
+        """Guardrail spans should not be created without a parent context (prevents orphaned traces)."""
+        otel = OpenTelemetry()
+        otel.tracer = MagicMock()
+
+        kwargs = {
+            "standard_logging_object": {
+                "guardrail_information": [{"guardrail_name": "test"}]
+            }
+        }
+        otel._create_guardrail_span(kwargs=kwargs, context=None)
+
+        # Should not create any spans when context is None
         otel.tracer.start_span.assert_not_called()
 
 
@@ -377,8 +404,17 @@ class TestOpenTelemetry(unittest.TestCase):
             "standard_logging_object": {"guardrail_information": [guardrail_info]}
         }
 
+        # Create a valid parent context to avoid orphaned span prevention
+        parent_context = trace.set_span_in_context(trace.NonRecordingSpan(
+            trace.SpanContext(
+                trace_id=1,
+                span_id=1,
+                is_remote=False,
+            )
+        ))
+
         # Call the method
-        otel._create_guardrail_span(kwargs=kwargs, context=None)
+        otel._create_guardrail_span(kwargs=kwargs, context=parent_context)
 
         # Assertions
         otel.tracer.start_span.assert_called_once()
@@ -408,9 +444,27 @@ class TestOpenTelemetry(unittest.TestCase):
 
         # Test with no guardrail information
         kwargs = {"standard_logging_object": {}}
-        otel._create_guardrail_span(kwargs=kwargs, context=None)
+        parent_context = trace.set_span_in_context(trace.NonRecordingSpan(
+            trace.SpanContext(trace_id=1, span_id=1, is_remote=False)
+        ))
+        otel._create_guardrail_span(kwargs=kwargs, context=parent_context)
 
         # Verify that start_span was never called
+        otel.tracer.start_span.assert_not_called()
+
+    def test_create_guardrail_span_with_no_context(self):
+        """Guardrail spans should not be created without a parent context (prevents orphaned traces)."""
+        otel = OpenTelemetry()
+        otel.tracer = MagicMock()
+
+        kwargs = {
+            "standard_logging_object": {
+                "guardrail_information": [{"guardrail_name": "test"}]
+            }
+        }
+        otel._create_guardrail_span(kwargs=kwargs, context=None)
+
+        # Should not create any spans when context is None
         otel.tracer.start_span.assert_not_called()
 
     def test_get_tracer_to_use_for_request_with_dynamic_headers(self):
