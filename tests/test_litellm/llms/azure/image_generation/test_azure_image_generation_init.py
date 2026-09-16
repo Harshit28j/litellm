@@ -1,17 +1,19 @@
 import json
-import os
-import sys
 import traceback
 from typing import Callable, Optional
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import httpx
 import pytest
+import respx
 
-sys.path.insert(
-    0, os.path.abspath("../../../../..")
-)  # Adds the parent directory to the system path
 import litellm
+from litellm.caching.llm_caching_handler import LLMClientCache
 from litellm.llms.azure.azure import AzureChatCompletion
+from litellm.llms.azure.image_generation.http_utils import (
+    azure_deployment_image_generation_json_body,
+)
+from litellm.llms.custom_httpx.http_handler import HTTPHandler
 from litellm.llms.azure.image_generation import (
     AzureDallE3ImageGenerationConfig,
     get_azure_image_generation_config,
@@ -30,6 +32,42 @@ from litellm.utils import get_optional_params_image_gen
 def test_azure_image_generation_config(received_model, expected_config):
     assert isinstance(
         get_azure_image_generation_config(received_model), expected_config
+    )
+
+
+def test_azure_deployment_image_generation_json_body():
+    """Deployment-scoped Azure image URL must not send ``model`` in JSON."""
+    api = (
+        "https://example.openai.azure.com/openai/deployments/my-dep/"
+        "images/generations?api-version=2025-04-01-preview"
+    )
+    data = {"model": "my-dep", "prompt": "x", "n": 1}
+    out = azure_deployment_image_generation_json_body(api, data)
+    assert "model" not in out
+    assert out == {"prompt": "x", "n": 1}
+
+
+def test_azure_providers_image_generation_json_body_keeps_model():
+    """Non-deployment routes (e.g. FLUX on Azure AI) keep the payload unchanged."""
+    api = "https://example.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro?api-version=preview"
+    data = {"model": "flux.2-pro", "prompt": "x"}
+    out = azure_deployment_image_generation_json_body(api, data)
+    assert out == data
+
+
+def test_azure_image_generation_mai_base_model_uses_mai_url():
+    azure_chat = AzureChatCompletion()
+    url = azure_chat.create_azure_base_url(
+        azure_client_params={
+            "azure_endpoint": "https://my-resource.services.ai.azure.com",
+            "api_version": "preview",
+        },
+        model="image-deployment-alias",
+        base_model="MAI-Image-2.5",
+    )
+    assert (
+        url
+        == "https://my-resource.services.ai.azure.com/mai/v1/images/generations?api-version=preview"
     )
 
 
@@ -260,22 +298,18 @@ def test_azure_image_generation_drop_params_false_raises_error():
 
 def test_azure_image_generation_base_model_vs_deployment_name():
     """
-    Test that Azure image generation correctly uses base_model in request body
-    but deployment name in the URL.
+    Test that Azure image generation omits ``model`` from the JSON body for
+    deployment URLs while keeping the deployment in the path.
 
-    When base_model is specified in litellm_params, the request should:
-    1. Use base_model (e.g., "gpt-image-1.5") in the JSON request body
-    2. Use the deployment name (e.g., "gpt-image-15") in the URL path
-
-    This is important because Azure expects:
-    - URL: /openai/deployments/{deployment_name}/images/generations
-    - Body: {"model": "{base_model}", ...}
+    Azure OpenAI routes image generation by deployment in the URL; the REST body
+    must not include ``model`` (sending deployment or base model there can break
+    gpt-image-2; see LiteLLM #26316). ``base_model`` in litellm_params is still used
+    internally for logging / hidden params.
 
     Example config:
-      model: azure/gpt-image-15  # deployment name
-      base_model: gpt-image-1.5  # actual model name
+      model: azure/gpt-image-15  # deployment name (URL only)
+      base_model: gpt-image-1.5  # optional, for LiteLLM metadata
     """
-    from unittest.mock import MagicMock
 
     # Setup test parameters
     azure_chat_completion = AzureChatCompletion()
@@ -295,26 +329,21 @@ def test_azure_image_generation_base_model_vs_deployment_name():
 
     optional_params = {"n": 1, "size": "1024x1024"}
 
-    # Mock the HTTP request to capture what gets sent
+    mock_http_response = MagicMock()
+    mock_http_response.status_code = 200
+    mock_http_response.json.return_value = {
+        "created": 1234567890,
+        "data": [{"url": "https://example.com/image.png", "revised_prompt": prompt}],
+    }
+
     with patch.object(
-        azure_chat_completion,
-        "make_sync_azure_httpx_request",
-        return_value=MagicMock(
-            json=lambda: {
-                "created": 1234567890,
-                "data": [
-                    {"url": "https://example.com/image.png", "revised_prompt": prompt}
-                ],
-            }
-        ),
-    ) as mock_request:
-        # Mock logging object
+        HTTPHandler, "post", return_value=mock_http_response
+    ) as mock_post:
         logging_obj = MagicMock()
         logging_obj.pre_call = MagicMock()
         logging_obj.post_call = MagicMock()
 
-        # Call the image_generation method
-        response = azure_chat_completion.image_generation(
+        azure_chat_completion.image_generation(
             prompt=prompt,
             timeout=60.0,
             optional_params=optional_params,
@@ -327,45 +356,32 @@ def test_azure_image_generation_base_model_vs_deployment_name():
             litellm_params=litellm_params,
         )
 
-        # Verify the mock was called
-        assert mock_request.called, "HTTP request should have been made"
-
-        # Get the call arguments
-        call_kwargs = mock_request.call_args.kwargs
-
-        # Verify the URL uses the deployment name (not base_model)
-        api_base_used = call_kwargs.get("api_base", "")
-        assert model in api_base_used, (
-            f"URL should contain deployment name '{model}', "
-            f"but got: {api_base_used}"
-        )
-        assert base_model not in api_base_used or base_model == model, (
+        assert mock_post.called, "HTTPHandler.post should be invoked"
+        post_kwargs = mock_post.call_args.kwargs
+        url_used = post_kwargs.get("url", "")
+        assert (
+            model in url_used
+        ), f"URL should contain deployment name '{model}', but got: {url_used}"
+        assert base_model not in url_used or base_model == model, (
             f"URL should NOT contain base_model '{base_model}' when it differs from deployment name, "
-            f"but got: {api_base_used}"
+            f"but got: {url_used}"
         )
 
-        # Verify the request body uses base_model (not deployment name)
-        request_data = call_kwargs.get("data", {})
-        assert request_data.get("model") == base_model, (
-            f"Request body 'model' field should be base_model '{base_model}', "
-            f"but got: {request_data.get('model')}"
-        )
-
-        # Verify other fields are correct
-        assert request_data.get("prompt") == prompt
-        assert request_data.get("n") == 1
-        assert request_data.get("size") == "1024x1024"
+        wire_json = post_kwargs.get("json") or {}
+        assert (
+            "model" not in wire_json
+        ), f"Azure deployment image gen must not send 'model' in JSON body; got keys: {list(wire_json)}"
+        assert wire_json.get("prompt") == prompt
+        assert wire_json.get("n") == 1
+        assert wire_json.get("size") == "1024x1024"
 
 
 @pytest.mark.asyncio
 async def test_azure_aimage_generation_base_model_vs_deployment_name():
     """
-    Test that Azure async image generation correctly uses base_model in request body
-    but deployment name in the URL.
-
-    This is the async version of test_azure_image_generation_base_model_vs_deployment_name.
+    Async variant of test_azure_image_generation_base_model_vs_deployment_name:
+    deployment in URL, no ``model`` in the JSON body sent to Azure.
     """
-    from unittest.mock import MagicMock
 
     # Setup test parameters
     azure_chat_completion = AzureChatCompletion()
@@ -384,27 +400,24 @@ async def test_azure_aimage_generation_base_model_vs_deployment_name():
         "api_version": api_version,
     }
 
-    # Mock the HTTP request to capture what gets sent
-    with patch.object(
-        azure_chat_completion,
-        "make_async_azure_httpx_request",
-        new_callable=AsyncMock,
-        return_value=MagicMock(
-            json=lambda: {
-                "created": 1234567890,
-                "data": [
-                    {"url": "https://example.com/image.png", "revised_prompt": prompt}
-                ],
-            }
-        ),
-    ) as mock_request:
-        # Mock logging object
+    mock_http_response = MagicMock()
+    mock_http_response.status_code = 200
+    mock_http_response.json.return_value = {
+        "created": 1234567890,
+        "data": [{"url": "https://example.com/image.png", "revised_prompt": prompt}],
+    }
+
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(return_value=mock_http_response)
+
+    with patch(
+        "litellm.llms.azure.azure.get_async_httpx_client", return_value=mock_client
+    ):
         logging_obj = MagicMock()
         logging_obj.pre_call = MagicMock()
         logging_obj.post_call = MagicMock()
 
-        # Call the aimage_generation method
-        response = await azure_chat_completion.aimage_generation(
+        await azure_chat_completion.aimage_generation(
             data=data,
             model_response=None,
             azure_client_params=azure_client_params,
@@ -412,30 +425,165 @@ async def test_azure_aimage_generation_base_model_vs_deployment_name():
             input=[],
             logging_obj=logging_obj,
             headers={},
-            model=model,  # Pass the deployment name
+            model=model,
             timeout=60.0,
         )
 
-        # Verify the mock was called
-        assert mock_request.called, "HTTP request should have been made"
+        assert mock_client.post.called
+        post_kwargs = mock_client.post.call_args.kwargs
+        url_used = post_kwargs.get("url", "")
+        assert model in url_used
+        wire_json = post_kwargs.get("json") or {}
+        assert "model" not in wire_json
+        assert data.get("model") == base_model
 
-        # Get the call arguments
-        call_kwargs = mock_request.call_args.kwargs
 
-        # Verify the URL uses the deployment name (not base_model)
-        api_base_used = call_kwargs.get("api_base", "")
-        assert model in api_base_used, (
-            f"URL should contain deployment name '{model}', "
-            f"but got: {api_base_used}"
-        )
-        assert base_model not in api_base_used or base_model == model, (
-            f"URL should NOT contain base_model '{base_model}' when it differs from deployment name, "
-            f"but got: {api_base_used}"
-        )
+@pytest.mark.parametrize("api_version", ["v1", "preview", "latest"])
+def test_azure_image_generation_v1_api_version_uses_v1_route(api_version):
+    """The v1 Azure surface exposes /openai/v1/images/generations and routes by body ``model``."""
+    url = AzureChatCompletion().create_azure_base_url(
+        azure_client_params={
+            "azure_endpoint": "https://my-resource.openai.azure.com",
+            "api_version": api_version,
+        },
+        model="gpt-image-1",
+        base_model=None,
+    )
+    assert url == f"https://my-resource.openai.azure.com/openai/v1/images/generations?api-version={api_version}"
+    data = {"model": "gpt-image-1", "prompt": "x"}
+    assert azure_deployment_image_generation_json_body(url, data) == data
 
-        # Verify the request body uses base_model (not deployment name)
-        request_data = call_kwargs.get("data", {})
-        assert request_data.get("model") == base_model, (
-            f"Request body 'model' field should be base_model '{base_model}', "
-            f"but got: {request_data.get('model')}"
-        )
+
+def test_azure_image_generation_dated_api_version_uses_deployment_route():
+    url = AzureChatCompletion().create_azure_base_url(
+        azure_client_params={
+            "azure_endpoint": "https://my-resource.openai.azure.com",
+            "api_version": "2024-10-21",
+        },
+        model="gpt-image-1",
+        base_model=None,
+    )
+    assert (
+        url
+        == "https://my-resource.openai.azure.com/openai/deployments/gpt-image-1/images/generations?api-version=2024-10-21"
+    )
+    assert "model" not in azure_deployment_image_generation_json_body(url, {"model": "gpt-image-1", "prompt": "x"})
+
+
+def test_azure_image_generation_v1_api_version_replaces_deployment_scoped_api_base():
+    url = AzureChatCompletion().create_azure_base_url(
+        azure_client_params={
+            "azure_endpoint": "https://my-resource.openai.azure.com/openai/deployments/gpt-image-1/images/generations",
+            "api_version": "preview",
+        },
+        model="gpt-image-1",
+        base_model=None,
+    )
+    assert url == "https://my-resource.openai.azure.com/openai/v1/images/generations?api-version=preview"
+
+
+def test_azure_image_generation_v1_api_version_uses_base_url_client_param():
+    url = AzureChatCompletion().create_azure_base_url(
+        azure_client_params={
+            "base_url": "https://my-resource.openai.azure.com/openai/deployments/gpt-image-1?api-version=2024-10-21",
+            "api_version": "preview",
+        },
+        model="gpt-image-1",
+        base_model=None,
+    )
+    assert url == "https://my-resource.openai.azure.com/openai/v1/images/generations?api-version=preview"
+
+
+def test_azure_v1_image_generation_json_body_sends_deployment_name():
+    """The v1 route ignores the URL and routes by body ``model``, which must be the deployment name."""
+    url = "https://my-resource.openai.azure.com/openai/v1/images/generations?api-version=preview"
+    data = {"model": "gpt-image-2", "prompt": "x", "n": 1}
+    out = azure_deployment_image_generation_json_body(url, data, deployment_name="img-dep")
+    assert out["model"] == "img-dep"
+    assert out["prompt"] == "x"
+    assert data["model"] == "gpt-image-2"
+    assert azure_deployment_image_generation_json_body(url, data) == data
+
+
+@pytest.mark.asyncio
+async def test_azure_aimage_generation_v1_route_sends_deployment_name_in_body(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    azure_chat_completion = AzureChatCompletion()
+    model = "img-dep"
+    base_model = "gpt-image-2"
+    data = {"model": base_model, "prompt": "A beautiful image of a cat", "n": 1}
+    azure_client_params = {
+        "azure_endpoint": "https://my-resource.openai.azure.com",
+        "api_version": "preview",
+    }
+
+    route = respx_mock.post("https://my-resource.openai.azure.com/openai/v1/images/generations").mock(
+        return_value=httpx.Response(200, json={"created": 1234567890, "data": [{"b64_json": "aaaa"}]})
+    )
+
+    logging_obj = MagicMock()
+    logging_obj.pre_call = MagicMock()
+    logging_obj.post_call = MagicMock()
+
+    await azure_chat_completion.aimage_generation(
+        data=data,
+        model_response=None,
+        azure_client_params=azure_client_params,
+        api_key="test-api-key",
+        input=[],
+        logging_obj=logging_obj,
+        headers={},
+        model=model,
+        timeout=60.0,
+    )
+
+    request = route.calls.last.request
+    assert str(request.url) == ("https://my-resource.openai.azure.com/openai/v1/images/generations?api-version=preview")
+    sent_body = json.loads(request.content)
+    assert sent_body["model"] == model
+    assert sent_body["prompt"] == data["prompt"]
+
+
+def test_azure_image_generation_v1_route_base_model_vs_deployment_name(respx_mock: respx.MockRouter):
+    """On the v1 surface the body ``model`` must be the deployment name, never base_model."""
+    azure_chat_completion = AzureChatCompletion()
+    prompt = "A beautiful image of a cat"
+    model = "img-dep"
+    base_model = "gpt-image-2"
+    api_base = "https://my-resource.openai.azure.com"
+    api_version = "v1"
+    litellm_params = {
+        "base_model": base_model,
+        "api_base": api_base,
+        "api_version": api_version,
+    }
+
+    route = respx_mock.post(f"{api_base}/openai/v1/images/generations").mock(
+        return_value=httpx.Response(200, json={"created": 1234567890, "data": [{"b64_json": "aaaa"}]})
+    )
+
+    logging_obj = MagicMock()
+    logging_obj.pre_call = MagicMock()
+    logging_obj.post_call = MagicMock()
+
+    azure_chat_completion.image_generation(
+        prompt=prompt,
+        timeout=60.0,
+        optional_params={"n": 1, "size": "1024x1024"},
+        logging_obj=logging_obj,
+        headers={},
+        model=model,
+        api_key="test-api-key",
+        api_base=api_base,
+        api_version=api_version,
+        litellm_params=litellm_params,
+    )
+
+    request = route.calls.last.request
+    assert str(request.url) == f"{api_base}/openai/v1/images/generations?api-version={api_version}"
+    sent_body = json.loads(request.content)
+    assert sent_body["model"] == model
+    assert sent_body["prompt"] == prompt

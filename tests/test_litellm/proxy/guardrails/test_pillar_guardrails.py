@@ -7,13 +7,10 @@ and following LiteLLM testing patterns and best practices.
 
 # Standard library imports
 import importlib
-import os
-import sys
-from typing import Dict
+from typing import Any, Dict
 from unittest.mock import Mock, patch
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.abspath("../../.."))
 
 # Third-party imports
 import json
@@ -65,7 +62,6 @@ def setup_and_teardown():
     asyncio.set_event_loop(loop)
 
     # Set up litellm state
-    litellm.set_verbose = True
     litellm.guardrail_name_config_map = {}
 
     yield
@@ -503,6 +499,38 @@ def test_get_logging_caching_headers_pillar_metadata():
         request_data["metadata"]["pillar_response_headers"]["x-pillar-flagged"]
         == "true"
     )
+
+
+def test_get_logging_caching_headers_ignores_untrusted_pillar_headers():
+    request_data = {
+        "metadata": {
+            "pillar_response_headers": {
+                "set-cookie": "session=evil",
+                "x-pillar-flagged": "true",
+            },
+            "pillar_flagged": True,
+        }
+    }
+
+    headers = get_logging_caching_headers(request_data)
+
+    assert "set-cookie" not in headers
+    assert "x-pillar-flagged" not in headers
+
+
+def test_get_logging_caching_headers_filters_non_pillar_headers():
+    request_data = {
+        "metadata": {
+            "pillar_flagged": True,
+        }
+    }
+    build_pillar_response_headers(request_data["metadata"])
+    request_data["metadata"]["pillar_response_headers"]["set-cookie"] = "session=evil"
+
+    headers = get_logging_caching_headers(request_data)
+
+    assert headers["x-pillar-flagged"] == "true"
+    assert "set-cookie" not in headers
 
 
 def test_get_logging_caching_headers_truncates_large_evidence():

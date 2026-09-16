@@ -42,8 +42,10 @@ class TestProcessAudioFile:
         assert result.filename == "audio.wav"
         assert result.content_type == "audio/wav"
 
-    def test_process_file_path_input(self):
-        """Test processing file path input"""
+    def test_process_pathlib_input(self):
+        """pathlib.Path is a Python-level type HTTP form values can't fabricate."""
+        from pathlib import Path
+
         test_content = b"test audio content"
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
@@ -51,14 +53,21 @@ class TestProcessAudioFile:
             temp_file_path = temp_file.name
 
         try:
-            result = process_audio_file(temp_file_path)
+            result = process_audio_file(Path(temp_file_path))
 
             assert isinstance(result, ProcessedAudioFile)
             assert result.file_content == test_content
             assert result.filename == os.path.basename(temp_file_path)
-            assert result.content_type == "audio/mpeg"  # .mp3 should map to audio/mpeg
+            assert result.content_type == "audio/mpeg"
         finally:
             os.unlink(temp_file_path)
+
+    def test_process_bare_str_path_rejected(self):
+        """Bare str paths are rejected — when this runs in a proxy request
+        handler the value is attacker-controlled, and opening it as a path
+        is an arbitrary local file read."""
+        with pytest.raises(ValueError, match="does not accept bare str inputs"):
+            process_audio_file("/etc/passwd")
 
     def test_process_tuple_input_with_bytes(self):
         """Test processing tuple input with bytes content"""
@@ -73,8 +82,10 @@ class TestProcessAudioFile:
         assert result.filename == filename
         assert result.content_type == "audio/wav"
 
-    def test_process_tuple_input_with_file_path(self):
-        """Test processing tuple input with file path content"""
+    def test_process_tuple_input_with_pathlib_content(self):
+        """Tuple input with pathlib.Path content is allowed; bare str content is not."""
+        from pathlib import Path
+
         test_content = b"test audio content"
 
         with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as temp_file:
@@ -83,7 +94,7 @@ class TestProcessAudioFile:
 
         try:
             filename = "custom_name.flac"
-            audio_tuple = (filename, temp_file_path)
+            audio_tuple = (filename, Path(temp_file_path))
 
             result = process_audio_file(audio_tuple)
 
@@ -315,3 +326,86 @@ class TestGetAudioFileContentHash:
 
         assert isinstance(hash_result, str)
         assert len(hash_result) == 64, "Should return valid hash even on fallback"
+
+
+class TestNormalizeTranscriptionLanguageToBcp47:
+    @pytest.mark.parametrize(
+        "language,expected",
+        [
+            ("en", "en-US"),
+            ("EN", "en-US"),
+            ("ja", "ja-JP"),
+            ("en-US", "en-US"),
+            ("en-GB", "en-GB"),
+            ("auto", "auto"),
+            ("xx", "xx"),
+        ],
+    )
+    def test_normalization(self, language, expected):
+        from litellm.litellm_core_utils.audio_utils.utils import (
+            normalize_transcription_language_to_bcp47,
+        )
+
+        assert normalize_transcription_language_to_bcp47(language) == expected
+
+
+class TestResolveSpeechMediaType:
+    @pytest.mark.parametrize(
+        ("upstream_content_type", "response_format", "expected"),
+        [
+            ("audio/wav", None, "audio/wav"),
+            ("AUDIO/WAV", None, "audio/wav"),
+            ("audio/flac; charset=binary", "mp3", "audio/flac"),
+            ("application/json", "flac", "audio/flac"),
+            ("application/octet-stream", "pcm", "audio/pcm"),
+            (None, "wav", "audio/wav"),
+            (None, "WAV", "audio/wav"),
+            (None, "opus", "audio/opus"),
+            (None, "aac", "audio/aac"),
+            (None, "mp3", "audio/mpeg"),
+            (None, "mp4", "audio/mpeg"),
+            (None, "bogus", "audio/mpeg"),
+            (None, None, "audio/mpeg"),
+            ("", None, "audio/mpeg"),
+        ],
+    )
+    def test_resolution(self, upstream_content_type, response_format, expected):
+        from litellm.litellm_core_utils.audio_utils.utils import resolve_speech_media_type
+
+        resolved = resolve_speech_media_type(
+            upstream_content_type=upstream_content_type,
+            response_format=response_format,
+        )
+        assert resolved == expected
+
+
+class TestSpeechMediaTypeFromAudioBytes:
+    @pytest.mark.parametrize(
+        ("audio", "expected"),
+        [
+            (b"RIFF\x24\x00\x00\x00WAVEfmt ", "audio/wav"),
+            (b"fLaC\x00\x00\x00\x22", "audio/flac"),
+            (b"OggS" + b"\x00" * 24 + b"OpusHead", "audio/opus"),
+            (b"OggS" + b"\x00" * 24 + b"\x01vorbis", "audio/ogg"),
+            (b"ID3\x04\x00\x00\x00\x00\x00\x00", "audio/mpeg"),
+            (b"\xff\xfb\x90\x64", "audio/mpeg"),
+            (b"\xff\xf3\x80\x00", "audio/mpeg"),
+            (b"\xff\xf1\x50\x80", "audio/aac"),
+            (b"\xff\xf9\x50\x80", "audio/aac"),
+            (b"RIFF\x24\x00\x00\x00AVI LIST", None),
+            (b"\xff\xff\xff\xff\xff\xff", None),
+            (b"\xff\xfb\xf0\x00", None),
+            (b"\xff\xfb\x9c\x00", None),
+            (b"\xff\xeb\x90\x00", None),
+            (b"\xff\xf1\xf4\x80", None),
+            (b"\xff\x00\x00\x00", None),
+            (b"\x00\x01\x02\x03\x04\x05", None),
+            (b"\xff\xfb", None),
+            (b"\xff", None),
+            (b"", None),
+        ],
+    )
+    def test_sniffing(self, audio, expected):
+        from litellm.litellm_core_utils.audio_utils.utils import speech_media_type_from_audio_bytes
+
+        assert speech_media_type_from_audio_bytes(audio) == expected

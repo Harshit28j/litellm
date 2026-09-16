@@ -1,14 +1,9 @@
 import json
-import os
-import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
-sys.path.insert(
-    0, os.path.abspath("../../../../..")
-)  # Adds the parent directory to the system path
 
 from litellm.llms.vertex_ai.multimodal_embeddings.transformation import (
     VertexAIMultimodalEmbeddingConfig,
@@ -147,3 +142,35 @@ class TestVertexMultimodalEmbedding:
         assert (
             result == expected_output
         ), f"Expected {expected_output}, but got {result}"
+
+    def test_dimensions_parameter_forwarded_as_dimension(self):
+        """Test that the dimensions parameter is forwarded as dimension
+        in the request body parameters field.
+
+        Fixes: https://github.com/BerriAI/litellm/issues/24392
+        """
+        optional_params = {}
+        optional_params = self.config.map_openai_params(
+            non_default_params={"dimensions": 128},
+            optional_params=optional_params,
+            model="multimodalembedding",
+            drop_params=False,
+        )
+        request = self.config.transform_embedding_request(
+            model="multimodalembedding",
+            input="Hello world",
+            optional_params=optional_params,
+            headers={},
+        )
+        assert "parameters" in request, "Request should contain 'parameters' field"
+        assert request["parameters"]["dimension"] == 128
+
+    def test_no_parameters_field_when_dimensions_not_set(self):
+        """Test that no parameters field is added when dimensions is not set."""
+        request = self.config.transform_embedding_request(
+            model="multimodalembedding",
+            input="Hello world",
+            optional_params={},
+            headers={},
+        )
+        assert "parameters" not in request

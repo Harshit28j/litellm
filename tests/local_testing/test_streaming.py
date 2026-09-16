@@ -4,7 +4,6 @@
 import asyncio
 import json
 import os
-import sys
 import time
 import traceback
 from litellm._uuid import uuid
@@ -19,9 +18,6 @@ import litellm.litellm_core_utils.litellm_logging
 from litellm.utils import ModelResponseListIterator
 from litellm.types.utils import ModelResponseStream
 
-sys.path.insert(
-    0, os.path.abspath("../..")
-)  # Adds the parent directory to the system path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -831,23 +827,29 @@ def test_completion_mistral_api_mistral_large_function_call_with_streaming():
             tool_choice="auto",
             stream=True,
         )
-        idx = 0
+        saw_function_call_chunk = False
         for chunk in response:
             print(f"chunk in response: {chunk}")
             assert chunk._hidden_params["custom_llm_provider"] == "mistral"
-            if idx == 0:
-                assert (
-                    chunk.choices[0].delta.tool_calls[0].function.arguments is not None
-                )
-                assert isinstance(
-                    chunk.choices[0].delta.tool_calls[0].function.arguments, str
-                )
-                validate_first_streaming_function_calling_chunk(chunk=chunk)
-            elif idx == 1 and chunk.choices[0].finish_reason is None:
-                validate_second_streaming_function_calling_chunk(chunk=chunk)
-            elif chunk.choices[0].finish_reason is not None:  # last chunk
+            if len(chunk.choices) == 0:
+                continue
+            if chunk.choices[0].finish_reason is not None:  # last chunk
                 validate_final_streaming_function_calling_chunk(chunk=chunk)
-            idx += 1
+                break
+            tool_calls = chunk.choices[0].delta.tool_calls
+            if tool_calls is None:
+                continue
+            assert tool_calls[0].function.arguments is not None
+            assert isinstance(tool_calls[0].function.arguments, str)
+            if not saw_function_call_chunk:
+                if chunk.choices[0].delta.role is not None:
+                    validate_first_streaming_function_calling_chunk(chunk=chunk)
+                else:
+                    validate_second_streaming_function_calling_chunk(chunk=chunk)
+                saw_function_call_chunk = True
+            else:
+                validate_second_streaming_function_calling_chunk(chunk=chunk)
+        assert saw_function_call_chunk
     except litellm.RateLimitError:
         pass
     except Exception as e:
@@ -945,7 +947,6 @@ def test_vertex_ai_stream(provider):
 
     load_vertex_ai_credentials()
     litellm.set_verbose = True
-    import random
 
     test_models = ["gemini-2.5-flash-lite"]
     for model in test_models:
@@ -987,6 +988,11 @@ def test_vertex_ai_stream(provider):
 
         except litellm.RateLimitError as e:
             pass
+        except litellm.exceptions.MidStreamFallbackError as e:
+            # Streaming 429s are wrapped in MidStreamFallbackError so the
+            # Router can fall back; treat as a transient rate-limit pass.
+            if not isinstance(e.original_exception, litellm.RateLimitError):
+                pytest.fail(f"Error occurred: {e}")
         except Exception as e:
             pytest.fail(f"Error occurred: {e}")
 
@@ -1162,8 +1168,7 @@ async def test_completion_replicate_llama3_streaming(sync_mode):
     "model, region",
     [
         # ["bedrock/ai21.jamba-instruct-v1:0", "us-east-1"],
-        # ["bedrock/cohere.command-r-plus-v1:0", None],
-        ["anthropic.claude-3-sonnet-20240229-v1:0", None],
+        ["us.anthropic.claude-sonnet-4-5-20250929-v1:0", None],
         # ["mistral.mistral-7b-instruct-v0:2", None],
         # ["meta.llama3-8b-instruct-v1:0", None],
     ],
@@ -1235,7 +1240,7 @@ def test_bedrock_claude_3_streaming():
     try:
         litellm.set_verbose = True
         response: ModelResponse = completion(  # type: ignore
-            model="bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+            model="bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
             messages=messages,
             max_tokens=10,  # type: ignore
             stream=True,
@@ -1264,8 +1269,8 @@ def test_bedrock_claude_3_streaming():
 @pytest.mark.parametrize(
     "model",
     [
-        "claude-4-sonnet-20250514",
-        "cohere.command-r-plus-v1:0",  # bedrock
+        "claude-haiku-4-5-20251001",
+        "bedrock/mistral.mistral-7b-instruct-v0:2",
         "gpt-3.5-turbo",
     ],
 )
@@ -2341,7 +2346,6 @@ def test_success_callback_streaming():
 from typing import List, Optional
 
 #### STREAMING + FUNCTION CALLING ###
-from pydantic import BaseModel
 
 
 class Function(BaseModel):
@@ -2558,7 +2562,6 @@ def test_azure_streaming_and_function_calling():
 
 @pytest.mark.asyncio
 async def test_azure_astreaming_and_function_calling():
-    from litellm._uuid import uuid
 
     tools = [
         {
@@ -2690,7 +2693,7 @@ def test_completion_claude_3_function_call_with_streaming():
     try:
         # test without max tokens
         response = completion(
-            model="claude-4-sonnet-20250514",
+            model="claude-haiku-4-5-20251001",
             messages=messages,
             tools=tools,
             tool_choice="required",
@@ -2915,11 +2918,14 @@ def test_unit_test_custom_stream_wrapper_repeating_chunk(
     print(f"expected_chunk_fail: {expected_chunk_fail}")
 
     if (loop_amount > litellm.REPEATED_STREAMING_CHUNK_LIMIT) and expected_chunk_fail:
+        def _drain():
+            for chunk in response:
+                continue
+
         with pytest.raises(
             (litellm.InternalServerError, litellm.exceptions.MidStreamFallbackError)
         ):
-            for chunk in response:
-                continue
+            _drain()
     else:
         for chunk in response:
             continue
@@ -3489,7 +3495,7 @@ def test_unit_test_perplexity_citations_chunk():
     [
         "gpt-3.5-turbo",
         "claude-sonnet-4-5-20250929",
-        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         # "vertex_ai/claude-3-5-sonnet@20240620",
     ],
 )
@@ -3634,7 +3640,7 @@ def test_mock_response_iterator_tool_use():
     [
         # "deepseek/deepseek-reasoner",
         # "anthropic/claude-3-7-sonnet-20250219",
-        "openrouter/anthropic/claude-3.7-sonnet",
+        "openrouter/anthropic/claude-sonnet-4.5",
     ],
 )
 def test_reasoning_content_completion(model):

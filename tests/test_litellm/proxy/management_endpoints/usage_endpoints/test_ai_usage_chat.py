@@ -409,3 +409,118 @@ class TestStreamUsageAiChat:
                 end_date="2025-01-31",
                 user_id="my-user-id",
             )
+
+
+class TestUsageAiChatServiceAccountGuard:
+    """
+    Security regression: a non-admin caller with user_id=None (service-account
+    key) must be rejected at the endpoint boundary, before any tool dispatch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_admin_with_user_id_none_is_rejected(self):
+        from fastapi import HTTPException
+
+        from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+        from litellm.proxy.management_endpoints.usage_endpoints.endpoints import (
+            ChatMessage,
+            UsageAIChatRequest,
+            usage_ai_chat,
+        )
+
+        service_account_key = UserAPIKeyAuth(
+            user_id=None,
+            user_role=LitellmUserRoles.INTERNAL_USER,
+        )
+        request = MagicMock()
+        body = UsageAIChatRequest(
+            messages=[ChatMessage(role="user", content="hi")],
+            model="gpt-4o-mini",
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await usage_ai_chat(
+                data=body,
+                request=request,
+                user_api_key_dict=service_account_key,
+            )
+
+        assert exc_info.value.status_code == 403
+        assert "Service-account keys" in str(exc_info.value.detail)
+
+    def test_resolve_fetch_kwargs_tripwire_fires_on_none_user_id(self):
+        """
+        Defense-in-depth: if a future endpoint forgets the entry guard and
+        a non-admin caller with user_id=None reaches _resolve_fetch_kwargs,
+        the tripwire must fire rather than issuing an unscoped query.
+        """
+        from litellm.proxy.management_endpoints.usage_endpoints.ai_usage_chat import (
+            _resolve_fetch_kwargs,
+        )
+
+        with pytest.raises(ValueError, match='Non-admin caller has user_id=None; refusing to issue an') as exc_info:
+            _resolve_fetch_kwargs(
+                fn_name="get_usage_data",
+                fn_args={"start_date": "2025-01-01", "end_date": "2025-01-31"},
+                user_id=None,
+                is_admin=False,
+            )
+        assert "Endpoint-level guard missing" in str(exc_info.value)
+
+
+class TestUsageAiChatKeepalive:
+    async def _collect_endpoint_body(self, monkeypatch, interval, delay=0.3) -> tuple[list[bytes], dict]:
+        import asyncio
+
+        import litellm
+        from fastapi.responses import StreamingResponse
+        from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+        from litellm.proxy.management_endpoints.usage_endpoints.endpoints import (
+            ChatMessage,
+            UsageAIChatRequest,
+            usage_ai_chat,
+        )
+
+        monkeypatch.setattr(litellm, "sse_keepalive_ping_interval_seconds", interval)
+
+        async def slow_acompletion(**kwargs):
+            await asyncio.sleep(delay)
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.tool_calls = None
+            response.choices[0].message.content = "Total spend is $50.25"
+            return response
+
+        with patch(  # test-quality-ok: the stream calls the module-level litellm.acompletion directly; no injection seam
+            "litellm.proxy.management_endpoints.usage_endpoints.ai_usage_chat.litellm.acompletion",
+            new=AsyncMock(side_effect=slow_acompletion),
+        ):
+            response = await usage_ai_chat(
+                data=UsageAIChatRequest(messages=[ChatMessage(role="user", content="hi")], model="gpt-4o-mini"),
+                request=MagicMock(),
+                user_api_key_dict=UserAPIKeyAuth(user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN),
+            )
+            assert isinstance(response, StreamingResponse)
+            chunks = [chunk if isinstance(chunk, bytes) else chunk.encode() async for chunk in response.body_iterator]
+        return chunks, dict(response.headers)
+
+    @pytest.mark.asyncio
+    async def test_endpoint_pings_while_the_planning_completion_is_still_running(self, monkeypatch):
+        chunks, headers = await self._collect_endpoint_body(monkeypatch, interval=0.05)
+
+        assert headers["content-type"].startswith("text/event-stream")
+        assert headers["cache-control"] == "no-cache"
+        assert headers["x-accel-buffering"] == "no"
+        assert chunks[0].startswith(b'data: {"type": "status"')
+        assert chunks[1] == b": ping\n\n"
+        assert chunks.count(b": ping\n\n") >= 3
+        assert b'"content": "Total spend is $50.25"' in b"".join(chunks)
+        assert chunks[-1] == b'data: {"type": "done"}\n\n'
+
+    @pytest.mark.asyncio
+    async def test_endpoint_stream_is_untouched_while_keepalives_are_unconfigured(self, monkeypatch):
+        chunks, _ = await self._collect_endpoint_body(monkeypatch, interval=None, delay=0.15)
+
+        assert b": ping\n\n" not in chunks
+        assert chunks[0].startswith(b'data: {"type": "status"')
+        assert chunks[-1] == b'data: {"type": "done"}\n\n'

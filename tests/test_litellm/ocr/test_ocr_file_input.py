@@ -12,14 +12,32 @@ Tests that:
 import base64
 import os
 import tempfile
+from collections.abc import Generator
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from typing import Final
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import orjson
 import pytest
+from starlette.datastructures import FormData
 
-from litellm.ocr.main import convert_file_document_to_url_document, get_mime_type
+from litellm.ocr.input import convert_file_document_to_url_document, get_mime_type
+
+
+@pytest.fixture(autouse=True, params=["native", "disabled", "unavailable"])
+def document_runtime(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    from litellm.rust_bridge import bindings, configuration
+
+    configuration.reset_rust_configuration()
+    monkeypatch.delenv("LITELLM_RUST", raising=False)
+    if request.param == "disabled":
+        monkeypatch.setenv("LITELLM_RUST", "0")
+        monkeypatch.setattr(bindings, "get_native_bridge", Mock(side_effect=AssertionError("Rust is disabled")))
+    elif request.param == "unavailable":
+        monkeypatch.setattr(bindings, "get_native_bridge", lambda: None)
+    yield
+    configuration.reset_rust_configuration()
 
 
 class TestGetMimeType:
@@ -60,14 +78,15 @@ class TestGetMimeType:
 
 
 class TestConvertFileDocumentToUrlDocument:
-    def test_should_convert_pdf_file_path_to_document_url(self):
-        """File path to a PDF should produce type=document_url with base64 data URI."""
+    def test_should_convert_pdf_pathlib_path_to_document_url(self):
+        """pathlib.Path to a PDF should produce type=document_url with base64 data URI.
+        Bare str paths are rejected — see test_should_reject_bare_str_path below."""
         pdf_content = b"%PDF-1.4 test content"
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_content)
             f.flush()
-            tmp_path = f.name
+            tmp_path = Path(f.name)
 
         try:
             result = convert_file_document_to_url_document(
@@ -80,16 +99,16 @@ class TestConvertFileDocumentToUrlDocument:
             b64_data = result["document_url"].split(";base64,")[1]
             assert base64.b64decode(b64_data) == pdf_content
         finally:
-            os.unlink(tmp_path)
+            os.unlink(str(tmp_path))
 
-    def test_should_convert_image_file_path_to_image_url(self):
-        """File path to a PNG image should produce type=image_url with base64 data URI."""
+    def test_should_convert_image_pathlib_path_to_image_url(self):
+        """pathlib.Path to a PNG image should produce type=image_url with base64 data URI."""
         png_content = b"\x89PNG\r\n\x1a\n fake png content"
 
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             f.write(png_content)
             f.flush()
-            tmp_path = f.name
+            tmp_path = Path(f.name)
 
         try:
             result = convert_file_document_to_url_document(
@@ -102,7 +121,16 @@ class TestConvertFileDocumentToUrlDocument:
             b64_data = result["image_url"].split(";base64,")[1]
             assert base64.b64decode(b64_data) == png_content
         finally:
-            os.unlink(tmp_path)
+            os.unlink(str(tmp_path))
+
+    def test_should_reject_bare_str_path(self):
+        """Bare str ``file`` values are rejected — when this runs in a proxy
+        request handler the value is attacker-controlled, and opening it as
+        a path is an arbitrary local file read on the proxy host."""
+        with pytest.raises(ValueError, match="does not accept bare str values"):
+            convert_file_document_to_url_document(
+                {"type": "file", "file": "/etc/passwd"}
+            )
 
     def test_should_convert_pathlib_path(self):
         """pathlib.Path objects should work the same as string paths."""
@@ -189,17 +217,17 @@ class TestConvertFileDocumentToUrlDocument:
         with pytest.raises(ValueError, match="must include a 'file' field"):
             convert_file_document_to_url_document({"type": "file"})
 
-    def test_should_raise_error_for_nonexistent_file_path(self):
-        """Non-existent file path should raise FileNotFoundError."""
+    def test_should_raise_error_for_nonexistent_pathlib_path(self):
+        """Non-existent pathlib.Path should raise FileNotFoundError."""
         with pytest.raises(FileNotFoundError, match="File not found"):
             convert_file_document_to_url_document(
-                {"type": "file", "file": "/nonexistent/path/to/file.pdf"}
+                {"type": "file", "file": Path("/nonexistent/path/to/file.pdf")}
             )
 
     def test_should_raise_error_for_empty_file(self):
         """Empty file should raise ValueError."""
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            tmp_path = f.name
+            tmp_path = Path(f.name)
 
         try:
             with pytest.raises(ValueError, match="File is empty"):
@@ -207,7 +235,7 @@ class TestConvertFileDocumentToUrlDocument:
                     {"type": "file", "file": tmp_path}
                 )
         finally:
-            os.unlink(tmp_path)
+            os.unlink(str(tmp_path))
 
     def test_should_raise_error_for_unsupported_type(self):
         """Unsupported file input types should raise ValueError."""
@@ -226,14 +254,14 @@ class TestConvertFileDocumentToUrlDocument:
                 }
             )
 
-    def test_should_override_mime_type_for_file_path(self):
+    def test_should_override_mime_type_for_pathlib_path(self):
         """Explicit mime_type should override auto-detection from extension."""
         content = b"some content"
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(content)
             f.flush()
-            tmp_path = f.name
+            tmp_path = Path(f.name)
 
         try:
             result = convert_file_document_to_url_document(
@@ -243,7 +271,7 @@ class TestConvertFileDocumentToUrlDocument:
             assert result["type"] == "image_url"
             assert result["image_url"].startswith("data:image/png;base64,")
         finally:
-            os.unlink(tmp_path)
+            os.unlink(str(tmp_path))
 
 
 class TestBuildDocumentFromUpload:
@@ -460,7 +488,7 @@ class TestProxySecurityGuard:
 
         mock_request = MagicMock()
         mock_request.headers = {"content-type": "multipart/form-data; boundary=---"}
-        mock_request.form = AsyncMock(return_value=mock_form)
+        mock_request.form = AsyncMock(return_value=FormData(mock_form))
 
         result = await self._parse_multipart(mock_request)
 
@@ -469,3 +497,37 @@ class TestProxySecurityGuard:
             "data:application/pdf;base64,"
         )
         assert result["model"] == "mistral/mistral-ocr-latest"
+
+
+@pytest.mark.asyncio
+async def test_proxy_upload_stops_reading_at_size_limit() -> None:
+    from starlette.datastructures import UploadFile
+
+    from litellm.ocr.input import get_max_file_bytes
+    from litellm.proxy.ocr_endpoints.endpoints import _parse_multipart_form
+
+    limit: Final = get_max_file_bytes()
+    with tempfile.TemporaryFile() as stream:
+        stream.truncate(limit * 2)
+        upload: Final = UploadFile(file=stream, filename="large.pdf")
+        request: Final = MagicMock(form=AsyncMock(return_value=FormData({"file": upload})))
+        with pytest.raises(ValueError, match="exceeds the size limit"):
+            await _parse_multipart_form(request)
+        assert stream.tell() == limit + 1
+
+
+@pytest.mark.asyncio
+async def test_proxy_upload_filename_is_only_metadata(tmp_path: Path) -> None:
+    from starlette.datastructures import UploadFile
+
+    from litellm.proxy.ocr_endpoints.endpoints import _parse_multipart_form
+
+    secret: Final = tmp_path / "secret.pdf"
+    secret.write_bytes(b"server secret")
+    upload: Final = UploadFile(file=BytesIO(b"uploaded bytes"), filename=str(secret))
+    request: Final = MagicMock(form=AsyncMock(return_value=FormData({"file": upload})))
+    result: Final = await _parse_multipart_form(request)
+    assert result["document"] == {
+        "type": "document_url",
+        "document_url": "data:application/pdf;base64,dXBsb2FkZWQgYnl0ZXM=",
+    }
